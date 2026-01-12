@@ -1,6 +1,6 @@
 """Handles icons for different entity types."""
 
-ICON_CAMERA_OFF = "mdi:camera-off"
+ICON_CAMERA_OFF = "mdi:video-off"
 ICON_AUDIO = "mdi:ear-hearing"
 ICON_AUDIO_OFF = "mdi:ear-hearing-off"
 ICON_PTZ_AUTOTRACKER = "mdi:cctv"
