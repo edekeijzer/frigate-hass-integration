@@ -161,6 +161,7 @@ class FrigateSwitch(FrigateMQTTEntity, SwitchEntity):
     def _state_message_received(self, msg: ReceiveMessage) -> None:
         """Handle a new received MQTT state message."""
         self._is_on = decode_if_necessary(msg.payload) == "ON"
+        self._icon = get_icon_from_switch(self._switch_namem, self._is_on)
         self.async_write_ha_state()
 
     @property
