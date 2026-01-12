@@ -1,10 +1,12 @@
 """Handles icons for different entity types."""
 
+ICON_CAMERA_OFF = "mdi:camera-off"
 ICON_AUDIO = "mdi:ear-hearing"
 ICON_AUDIO_OFF = "mdi:ear-hearing-off"
 ICON_PTZ_AUTOTRACKER = "mdi:cctv"
 ICON_DESCRIPTIONS = "mdi:text-box-check"
 ICON_BICYCLE = "mdi:bicycle"
+ICON_BIRD = "mdi:bird"
 ICON_CAR = "mdi:car"
 ICON_CAT = "mdi:cat"
 ICON_CONTRAST = "mdi:contrast-circle"
@@ -49,6 +51,8 @@ def get_dynamic_icon_from_type(obj_type: str, is_on: bool) -> str:
 
 def get_icon_from_switch(switch_type: str) -> str:
     """Get icon for a specific switch type."""
+    if switch_type == "enabled":
+        return ICON_CAMERA_OFF
     if switch_type == "snapshots":
         return ICON_IMAGE_MULTIPLE
     if switch_type == "recordings":
@@ -88,5 +92,7 @@ def get_icon_from_type(obj_type: str) -> str:
         return ICON_COW
     if obj_type == "horse":
         return ICON_HORSE
+    if obj_type == "bird":
+        return ICON_BIRD
 
     return ICON_OTHER
