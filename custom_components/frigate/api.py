@@ -133,7 +133,7 @@ class FrigateApiClient:
         after: float | None = None,
         before: float | None = None,
         limit: int | None = None,
-        reviewed: bool = False,
+        reviewed: bool | None = None,
         decode_json: bool = True,
     ) -> list[dict[str, Any]]:
         """Get review items from the API."""
@@ -145,7 +145,7 @@ class FrigateApiClient:
             "after": after,
             "before": before,
             "limit": limit,
-            "reviewed": int(reviewed),
+            "reviewed": int(reviewed) if reviewed is not None else None,
         }
 
         return cast(
@@ -381,6 +381,31 @@ class FrigateApiClient:
             timeout=REVIEW_SUMMARIZE_TIMEOUT,
         )
         return cast(dict[str, Any], result) if decode_json else result
+
+    async def async_chat_completion(
+        self,
+        query: str,
+        camera_name: str | None = None,
+    ) -> dict[str, Any]:
+        """Send a chat completion request to Frigate."""
+        data: dict[str, Any] = {
+            "messages": [{"role": "user", "content": query}],
+            "max_tool_iterations": 5,
+            "stream": False,
+            "enable_thinking": False,
+        }
+        if camera_name:
+            data["include_live_image"] = camera_name
+
+        return cast(
+            dict[str, Any],
+            await self.api_wrapper(
+                "post",
+                str(URL(self._host) / "api/chat/completion"),
+                data=data,
+                timeout=REVIEW_SUMMARIZE_TIMEOUT,
+            ),
+        )
 
     async def _get_token(self) -> None:
         """

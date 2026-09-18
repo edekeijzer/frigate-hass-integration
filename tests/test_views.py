@@ -7,18 +7,21 @@ import copy
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 import logging
+import ssl
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 from aiohttp import web
 from hass_web_proxy_lib.tests.utils import response_handler, ws_response_handler
 import pytest
+from yarl import URL
 
 from custom_components.frigate.const import (
     ATTR_CLIENT_ID,
     ATTR_MQTT,
     CONF_NOTIFICATION_PROXY_ENABLE,
     CONF_NOTIFICATION_PROXY_EXPIRE_AFTER_SECONDS,
+    CONF_VALIDATE_SSL,
     DOMAIN,
 )
 from homeassistant.components.http.auth import async_sign_path
@@ -63,6 +66,8 @@ async def local_frigate(hass: HomeAssistant, aiohttp_server: Any) -> Any:
             web.get("/api/events/event_id/snapshot.jpg", response_handler),
             web.get("/api/events/event_id/clip.mp4", response_handler),
             web.get("/vod/event/event_id/master.m3u8", response_handler),
+            web.get("/vod/event/event_id/init-v1.mp4", response_handler),
+            web.get("/vod/event/event_id/init-v1-a1.mp4", response_handler),
             web.get("/api/events/event_id/preview.gif", response_handler),
             web.get("/api/review/event_id/preview", response_handler),
             web.get("/clips/review/thumb-camera_name-event_id.webp", response_handler),
@@ -81,8 +86,9 @@ async def local_frigate(hass: HomeAssistant, aiohttp_server: Any) -> Any:
             web.get("/live/mse/querystring", ws_response_handler),
             web.get("/live/webrtc/front_door", ws_response_handler),
             web.get("/live/webrtc/querystring", ws_response_handler),
-            web.get("/api/go2rtc/api/streams", response_handler),
-            web.get("/api/go2rtc/api/ws", ws_response_handler),
+            web.get("/api/go2rtc/streams", response_handler),
+            web.get("/api/go2rtc/streams/front_door", response_handler),
+            web.get("/live/mse/api/ws", ws_response_handler),
             web.get(
                 "/api/front_door/start/1664067600.02/end/1664068200.03/clip.mp4",
                 response_handler,
@@ -138,18 +144,36 @@ async def test_vod_segment_proxy(
     assert resp.status == HTTPStatus.OK
 
 
+async def test_vod_segment_proxy_authenticated_without_signature(
+    local_frigate: Any,
+    hass_client: Any,
+) -> None:
+    """Test that a normally-authenticated request needs no signed authSig.
+
+    A client that authenticates the same way as every other Frigate proxy view
+    here (e.g. a Bearer token as a header) shouldn't also need a signed URL —
+    that mechanism exists for Home Assistant's own frontend media browser,
+    which plays this through a plain <video> tag that can't attach an
+    Authorization header at all.
+    """
+
+    authenticated_hass_client = await hass_client()
+    resp = await authenticated_hass_client.get("/api/frigate/vod/present/segment.ts")
+    assert resp.status == HTTPStatus.OK
+
+
 async def test_vod_segment_proxy_unauthorized(
     hass: HomeAssistant,
     hass_access_token: Any,
     local_frigate: Any,
-    hass_client: Any,
+    hass_client_no_auth: Any,
 ) -> None:
     """Test vod segment."""
 
-    authenticated_hass_client = await hass_client()
+    unauthenticated_hass_client = await hass_client_no_auth()
 
     # No secret set
-    resp = await authenticated_hass_client.get("/api/frigate/vod/present/segment.ts")
+    resp = await unauthenticated_hass_client.get("/api/frigate/vod/present/segment.ts")
     assert resp.status == HTTPStatus.UNAUTHORIZED
 
     refresh_token = hass.auth.async_validate_access_token(hass_access_token)
@@ -163,20 +187,87 @@ async def test_vod_segment_proxy_unauthorized(
     )
 
     # No signature
-    resp = await authenticated_hass_client.get("/api/frigate/vod/present/segment.ts")
+    resp = await unauthenticated_hass_client.get("/api/frigate/vod/present/segment.ts")
     assert resp.status == HTTPStatus.UNAUTHORIZED
 
     # Wrong signature
-    resp = await authenticated_hass_client.get(
+    resp = await unauthenticated_hass_client.get(
         "/api/frigate/vod/present/segment.ts?authSig=invalid"
     )
     assert resp.status == HTTPStatus.UNAUTHORIZED
 
     # Modified path
-    resp = await authenticated_hass_client.get(
+    resp = await unauthenticated_hass_client.get(
         signed_path.replace("/api/frigate/", "/api/frigate/mod/")
     )
     assert resp.status == HTTPStatus.UNAUTHORIZED
+
+
+async def test_vod_segment_proxy_unauthenticated_with_valid_signature(
+    hass: HomeAssistant,
+    hass_access_token: Any,
+    local_frigate: Any,
+    hass_client_no_auth: Any,
+) -> None:
+    """Test that an unauthenticated request with a valid signature succeeds.
+
+    This particular signature happens to be signed for the exact segment
+    path being requested, which Home Assistant's own generic signed-request
+    middleware (async_validate_signed_request) already authenticates via an
+    exact path match, ahead of this view ever running — see the dedicated
+    test below for the case that actually depends on
+    VodSegmentProxyView's own looser, prefix-based signature check.
+    """
+
+    refresh_token = hass.auth.async_validate_access_token(hass_access_token)
+    assert refresh_token
+
+    signed_path = async_sign_path(
+        hass,
+        "/api/frigate/vod/present/segment.ts",
+        timedelta(seconds=5),
+        refresh_token_id=refresh_token.id,
+    )
+
+    unauthenticated_hass_client = await hass_client_no_auth()
+    resp = await unauthenticated_hass_client.get(signed_path)
+    assert resp.status == HTTPStatus.OK
+
+
+async def test_vod_segment_proxy_unauthenticated_with_valid_manifest_signature(
+    hass: HomeAssistant,
+    hass_access_token: Any,
+    local_frigate: Any,
+    hass_client_no_auth: Any,
+) -> None:
+    """Test a segment authorized by a signature scoped to its manifest.
+
+    Only the VOD manifest URL is ever actually signed and handed to a
+    client — each segment it references is then fetched from a sibling
+    path using that same signature. Home Assistant's own generic signed-
+    request validation requires an exact path match, so it can't
+    authenticate this (the signed path is the manifest's, not the
+    segment's): this is exactly why VodSegmentProxyView keeps its own
+    prefix-based _async_validate_signed_manifest() check rather than
+    relying solely on core auth.
+    """
+
+    refresh_token = hass.auth.async_validate_access_token(hass_access_token)
+    assert refresh_token
+
+    signed_manifest_path = async_sign_path(
+        hass,
+        "/api/frigate/vod/present/manifest.m3u8",
+        timedelta(seconds=5),
+        refresh_token_id=refresh_token.id,
+    )
+    signature = URL(signed_manifest_path).query["authSig"]
+
+    unauthenticated_hass_client = await hass_client_no_auth()
+    resp = await unauthenticated_hass_client.get(
+        f"/api/frigate/vod/present/segment.ts?authSig={signature}"
+    )
+    assert resp.status == HTTPStatus.OK
 
 
 async def test_snapshot_proxy_view(
@@ -290,6 +381,36 @@ async def test_notifications_proxy_view_hls(
         "/api/frigate/notifications/event_id/camera/master.m3u8"
     )
     assert resp.status == HTTPStatus.OK
+
+
+@pytest.mark.parametrize("segment_name", ["init-v1.mp4", "init-v1-a1.mp4"])
+async def test_notifications_proxy_view_hls_init_segment(
+    local_frigate: Any,
+    hass_client_no_auth: Any,
+    segment_name: str,
+) -> None:
+    """Test notification HLS init segments."""
+
+    unauthenticated_hass_client = await hass_client_no_auth()
+
+    resp = await unauthenticated_hass_client.get(
+        f"/api/frigate/notifications/event_id/camera/{segment_name}"
+    )
+    assert resp.status == HTTPStatus.OK
+
+
+async def test_notifications_proxy_view_rejects_non_init_mp4(
+    local_frigate: Any,
+    hass_client_no_auth: Any,
+) -> None:
+    """Test notification proxy rejects arbitrary mp4 files."""
+
+    unauthenticated_hass_client = await hass_client_no_auth()
+
+    resp = await unauthenticated_hass_client.get(
+        "/api/frigate/notifications/event_id/camera/not-init.mp4"
+    )
+    assert resp.status == HTTPStatus.NOT_FOUND
 
 
 async def test_notifications_proxy_view_clip(
@@ -778,7 +899,7 @@ async def test_go2rtc_api_ws_proxy_view(
     ) as ws:
         # First message from the fixture will be the URL and headers.
         request = await ws.receive_json()
-        assert request["url"].endswith("/api/go2rtc/api/ws")
+        assert request["url"].endswith("/live/mse/api/ws")
 
         # Subsequent messages will echo back.
         await ws.send_str("Hello!")
@@ -793,8 +914,16 @@ async def test_go2rtc_api_proxy_view(
 
     authenticated_hass_client = await hass_client()
 
+    # Test streams endpoint routes to Frigate's safe API (credentials masked)
     resp = await authenticated_hass_client.get(
         f"/api/frigate/{TEST_FRIGATE_INSTANCE_ID}/go2rtc/api/streams"
+    )
+    assert resp.status == HTTPStatus.OK
+
+    # Test streams endpoint with src query param routes to per-stream API
+    resp = await authenticated_hass_client.get(
+        f"/api/frigate/{TEST_FRIGATE_INSTANCE_ID}/go2rtc/api/streams",
+        params={"src": "front_door"},
     )
     assert resp.status == HTTPStatus.OK
 
@@ -807,6 +936,67 @@ async def test_go2rtc_api_proxy_view(
         "/api/frigate/NOT_A_REAL_ID/go2rtc/api/streams"
     )
     assert resp.status == HTTPStatus.NOT_FOUND
+
+
+@pytest.fixture
+async def local_frigate_017(hass: HomeAssistant, aiohttp_server: Any) -> Any:
+    """Point the integration at a local fake Frigate server running pre-0.18."""
+
+    server = await start_frigate_server(
+        aiohttp_server,
+        [
+            web.get("/api/go2rtc/api/streams", response_handler),
+            web.get("/api/go2rtc/api/ws", ws_response_handler),
+        ],
+    )
+
+    config_017 = copy.deepcopy(TEST_CONFIG)
+    config_017["version"] = "0.17-0"
+
+    client = create_mock_frigate_client()
+    client.async_get_config = AsyncMock(return_value=config_017)
+    client.get_auth_headers = AsyncMock(return_value={"Authorization": "Bearer token"})
+    config_entry = create_mock_frigate_config_entry(
+        hass, data={CONF_URL: str(server.make_url("/"))}
+    )
+    await setup_mock_frigate_config_entry(
+        hass, config_entry=config_entry, client=client
+    )
+    LocalFrigate = namedtuple("LocalFrigate", ["server", "client", "config_entry"])
+    return LocalFrigate(server, client, config_entry)
+
+
+async def test_go2rtc_api_ws_proxy_view_pre_018(
+    hass: Any,
+    local_frigate_017: Any,
+    hass_client: Any,
+) -> None:
+    """Test Go2RTC API websocket uses old path on pre-0.18 Frigate."""
+
+    authenticated_hass_client = await hass_client()
+
+    async with authenticated_hass_client.ws_connect(
+        f"/api/frigate/{TEST_FRIGATE_INSTANCE_ID}/go2rtc/ws/api/ws"
+    ) as ws:
+        request = await ws.receive_json()
+        assert request["url"].endswith("/api/go2rtc/api/ws")
+
+        await ws.send_str("Hello!")
+        assert (await ws.receive_str()) == "Hello!"
+
+
+async def test_go2rtc_api_proxy_view_pre_018(
+    local_frigate_017: Any,
+    hass_client: Any,
+) -> None:
+    """Test Go2RTC API HTTP uses old path on pre-0.18 Frigate."""
+
+    authenticated_hass_client = await hass_client()
+
+    resp = await authenticated_hass_client.get(
+        f"/api/frigate/{TEST_FRIGATE_INSTANCE_ID}/go2rtc/api/streams"
+    )
+    assert resp.status == HTTPStatus.OK
 
 
 async def test_review_clips_proxy_view(
@@ -851,3 +1041,99 @@ async def test_review_clips_with_frigate_instance_id(
         "/api/frigate/NOT_A_REAL_ID/clips/review/thumb-abc123.webp"
     )
     assert resp.status == HTTPStatus.NOT_FOUND
+
+
+async def test_snapshot_proxy_with_ssl_validation_disabled(
+    hass: Any,
+    aiohttp_server: Any,
+    hass_client: Any,
+) -> None:
+    """Test proxy view creates SSL context when SSL validation is disabled."""
+    server = await start_frigate_server(
+        aiohttp_server,
+        [web.get("/api/events/event_id/snapshot.jpg", response_handler)],
+    )
+
+    client = create_mock_frigate_client()
+    client.get_auth_headers = AsyncMock(return_value={"Authorization": "Bearer token"})
+    config_entry = create_mock_frigate_config_entry(
+        hass,
+        data={CONF_URL: str(server.make_url("/")), CONF_VALIDATE_SSL: False},
+    )
+    await setup_mock_frigate_config_entry(
+        hass, config_entry=config_entry, client=client
+    )
+
+    authenticated_hass_client = await hass_client()
+
+    mock_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    with patch(
+        "custom_components.frigate.views.get_default_no_verify_context",
+        return_value=mock_ctx,
+    ) as mock_get_ctx:
+        resp = await authenticated_hass_client.get("/api/frigate/snapshot/event_id")
+        assert resp.status == HTTPStatus.OK
+        mock_get_ctx.assert_called_once()
+
+
+async def test_snapshot_proxy_with_ssl_validation_enabled(
+    hass: Any,
+    aiohttp_server: Any,
+    hass_client: Any,
+) -> None:
+    """Test proxy view does not modify SSL context when SSL validation is enabled."""
+    server = await start_frigate_server(
+        aiohttp_server,
+        [web.get("/api/events/event_id/snapshot.jpg", response_handler)],
+    )
+
+    client = create_mock_frigate_client()
+    client.get_auth_headers = AsyncMock(return_value={"Authorization": "Bearer token"})
+    config_entry = create_mock_frigate_config_entry(
+        hass,
+        data={CONF_URL: str(server.make_url("/")), CONF_VALIDATE_SSL: True},
+    )
+    await setup_mock_frigate_config_entry(
+        hass, config_entry=config_entry, client=client
+    )
+
+    authenticated_hass_client = await hass_client()
+
+    with patch(
+        "custom_components.frigate.views.get_default_no_verify_context",
+    ) as mock_get_ctx:
+        resp = await authenticated_hass_client.get("/api/frigate/snapshot/event_id")
+        assert resp.status == HTTPStatus.OK
+        mock_get_ctx.assert_not_called()
+
+
+async def test_snapshot_proxy_with_ssl_context_already_set() -> None:
+    """Test proxy view returns early when ssl_context is already provided."""
+    from unittest.mock import Mock
+
+    from hass_web_proxy_lib import ProxiedURL, ProxyView
+
+    from custom_components.frigate.views import FrigateProxyViewMixin
+
+    class TestView(FrigateProxyViewMixin, ProxyView):
+        def _get_proxied_url_impl(
+            self, request: web.Request, **kwargs: Any
+        ) -> ProxiedURL:
+            return ProxiedURL(
+                url="https://example.com",
+                headers={},
+                query_params={},
+                ssl_context=ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+            )
+
+    view = object.__new__(TestView)
+    request = Mock()
+    request.app = {}
+
+    with patch(
+        "custom_components.frigate.views.get_default_no_verify_context",
+    ) as mock_get_ctx:
+        result = view._get_proxied_url(request)
+
+    assert result.ssl_context is not None
+    mock_get_ctx.assert_not_called()
